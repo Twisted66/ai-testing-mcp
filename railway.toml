@@ -3,8 +3,7 @@
 
 [deploy]
   startCommand = "npm start"
-  restartPolicyType = "on-failure"
-  restartPolicyMaxRetries = 10
 
 [variables]
   NODE_ENV = "production"
+  PORT = "8080"
