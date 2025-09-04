@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ai-testing": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "cwd": "/path/to/ai-testing-mcp"
+    }
+  }
+}
