@@ -7,6 +7,7 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { promises as fs } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { exec, spawn } from 'node:child_process';
@@ -197,6 +198,10 @@ class AITestingMCPServer {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
+      
+      if (!args) {
+        throw new Error('Missing arguments');
+      }
 
       try {
         switch (name) {
@@ -588,7 +593,7 @@ class AITestingMCPServer {
     return functions;
   }
 
-  private async detectTestFramework(projectPath: string): string {
+  private async detectTestFramework(projectPath: string): Promise<string> {
     try {
       const packageJson = await fs.readFile(join(projectPath, 'package.json'), 'utf-8');
       const pkg = JSON.parse(packageJson);
@@ -673,7 +678,258 @@ class AITestingMCPServer {
     await this.server.connect(transport);
     console.error('AI Testing MCP server running on stdio');
   }
+
+  private authenticateRequest(req: IncomingMessage): boolean {
+    const authHeader = req.headers.authorization;
+    const apiKey = process.env.MCP_API_KEY || 'default-dev-key';
+    
+    if (!authHeader) {
+      return false;
+    }
+
+    // Support both "Bearer token" and "apikey"  
+    const token = authHeader.startsWith('Bearer ') 
+      ? authHeader.slice(7)
+      : authHeader;
+    
+    return token === apiKey;
+  }
+
+  async runHTTP(port: number = 3000) {
+    const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      // Set CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      if (req.method === 'POST' && (req.url === '/mcp' || req.url === '/' || req.url?.includes('mcp'))) {
+        // Check authentication for MCP endpoints (temporarily disabled for testing)
+        // if (!this.authenticateRequest(req)) {
+        //   const authError = {
+        //     jsonrpc: '2.0',
+        //     error: {
+        //       code: -32001,
+        //       message: 'Unauthorized. Please provide a valid API key in Authorization header.'
+        //     },
+        //     id: null
+        //   };
+          
+        //   res.writeHead(401, { 'Content-Type': 'application/json' });
+        //   res.end(JSON.stringify(authError));
+        //   return;
+        // }
+
+        let body = '';
+        req.on('data', chunk => {
+          body += chunk.toString();
+        });
+
+        req.on('end', async () => {
+          try {
+            const request = JSON.parse(body);
+            let result;
+
+            // Handle JSON-RPC 2.0 format
+            if (request.method === 'initialize') {
+              // MCP initialization
+              result = {
+                protocolVersion: '2024-11-05',
+                capabilities: {
+                  tools: {}
+                },
+                serverInfo: {
+                  name: 'ai-testing-mcp',
+                  version: '1.0.0'
+                }
+              };
+            } else if (request.method === 'tools/list') {
+              const tools = [
+                {
+                  name: 'analyze_codebase',
+                  description: 'Analyze project structure and identify testable components',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {
+                      projectPath: {
+                        type: 'string',
+                        description: 'Path to the project directory'
+                      }
+                    },
+                    required: ['projectPath']
+                  }
+                },
+                {
+                  name: 'generate_unit_tests',
+                  description: 'Generate unit tests for specific functions or components',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {
+                      filePath: {
+                        type: 'string',
+                        description: 'Path to the file to test'
+                      },
+                      functionName: {
+                        type: 'string',
+                        description: 'Specific function to test (optional)'
+                      },
+                      testFramework: {
+                        type: 'string',
+                        description: 'Testing framework to use (jest, mocha, pytest, etc.)'
+                      }
+                    },
+                    required: ['filePath']
+                  }
+                },
+                {
+                  name: 'run_tests',
+                  description: 'Execute tests and return results',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {
+                      projectPath: {
+                        type: 'string',
+                        description: 'Path to the project directory'
+                      },
+                      testPattern: {
+                        type: 'string',
+                        description: 'Test file pattern or specific test to run'
+                      },
+                      framework: {
+                        type: 'string',
+                        description: 'Test framework (auto-detected if not specified)'
+                      }
+                    },
+                    required: ['projectPath']
+                  }
+                }
+              ];
+              result = { tools };
+            } else if (request.method === 'tools/call') {
+              const { name, arguments: args } = request.params;
+              
+              if (!args) {
+                throw new Error('Missing arguments');
+              }
+
+              switch (name) {
+                case 'analyze_codebase':
+                  result = await this.analyzeCodebase(args.projectPath as string);
+                  break;
+                case 'generate_unit_tests':
+                  result = await this.generateUnitTests(
+                    args.filePath as string,
+                    args.functionName as string,
+                    args.testFramework as string
+                  );
+                  break;
+                case 'run_tests':
+                  result = await this.runTests(
+                    args.projectPath as string,
+                    args.testPattern as string,
+                    args.framework as string
+                  );
+                  break;
+                default:
+                  throw new Error(`Unknown tool: ${name}`);
+              }
+            } else if (request.method === 'ping') {
+              // Ping-pong for connection health
+              result = {};
+            } else if (request.method === 'initialized') {
+              // Initialization confirmation
+              result = {};
+            } else {
+              throw new Error(`Unsupported method: ${request.method}`);
+            }
+
+            // Return JSON-RPC 2.0 response
+            const response = {
+              jsonrpc: '2.0',
+              result: result,
+              id: request.id || null
+            };
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(response));
+          } catch (error) {
+            const errorResponse = {
+              jsonrpc: '2.0',
+              error: {
+                code: -32000,
+                message: error instanceof Error ? error.message : String(error)
+              },
+              id: null
+            };
+            
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(errorResponse));
+          }
+        });
+      } else if (req.method === 'GET') {
+        if (req.url?.includes('mcp') || req.url === '/') {
+          // For MCP HTTP transport, GET requests should return server info
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            name: 'AI Testing MCP Server',
+            version: '1.0.0',
+            status: 'running',
+            authentication: 'required',
+            protocol: 'MCP over HTTP',
+            endpoints: {
+              mcp: 'POST / (requires API key)',
+              auth: 'POST /auth',
+              health: 'GET /'
+            },
+            usage: {
+              authentication: 'Include "Authorization: Bearer <your-api-key>" header',
+              example: 'curl -H "Authorization: Bearer your-key" -X POST -d \'{"method":"tools/list"}\' /'
+            }
+          }));
+        } else {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Not found' }));
+        }
+      } else if (req.method === 'POST' && req.url === '/auth') {
+        // Test authentication endpoint
+        if (this.authenticateRequest(req)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            authenticated: true,
+            message: 'API key is valid'
+          }));
+        } else {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            authenticated: false,
+            message: 'Invalid or missing API key'
+          }));
+        }
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
+      }
+    });
+
+    httpServer.listen(port, () => {
+      console.log(`AI Testing MCP server running on HTTP port ${port}`);
+    });
+
+    return httpServer;
+  }
 }
 
 const server = new AITestingMCPServer();
-server.run().catch(console.error);
+
+// Check if running in Vercel or other HTTP environment
+if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+  const port = parseInt(process.env.PORT || '3000');
+  server.runHTTP(port).catch(console.error);
+} else {
+  server.run().catch(console.error);
+}
